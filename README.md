@@ -10,6 +10,30 @@
 ![Build status](https://img.shields.io/github/actions/workflow/status/pando85/passless/rust.yml?branch=master)
 ![passless license](https://img.shields.io/github/license/pando85/passless)
 
+> [!IMPORTANT]
+>
+> **This is a fork of [pando85/passless](https://github.com/pando85/passless).** It carries one
+> fix, and anything that needs backup-eligible passkeys must use this fork, not the upstream
+> release or the AUR `passless` / `passless-bin` packages.
+>
+> **Why:** in upstream v0.20.2 the human authenticator is built with the agent-mode options, which
+> hard-code every new credential as single-device (`BE=0`). `enable_credential_backup`,
+> `--enable-credential-backup` and `PASSLESS_ENABLE_CREDENTIAL_BACKUP` therefore have no effect on
+> the wire or in the stored record. Passkeys that are also held by a password manager (for example
+> Bitwarden, which always reports `BE=1 BS=1`) are then rejected by relying parties that saw `BE=1`
+> at registration.
+>
+> **Fix:** `build_authenticator_with_interaction` now enables agent options only when an agent
+> interaction manager is present, and the backup state is chosen by `default_backup_state`, which
+> is `Eligible` only for the human authenticator with the setting on. Agent credentials stay
+> single-device. Regression tests: `test_human_authenticator_honours_enable_credential_backup` and
+> `test_default_backup_state_is_eligible_only_for_human_with_setting_on`.
+>
+> **Use it:** build from this repository (`cargo build --release --features agent`) or install the
+> binary from this fork's [releases](https://github.com/wbrous/passless/releases). It is otherwise
+> identical to upstream. Continuous integration is disabled on this fork, and the badge above
+> reflects upstream.
+
 Passless is a software FIDO2 authenticator that emulates hardware security keys. Built with
 [soft-fido2](https://github.com/pando85/soft-fido2), it runs as a virtual UHID device on Linux.
 
