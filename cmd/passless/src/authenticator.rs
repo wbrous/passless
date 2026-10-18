@@ -45,6 +45,21 @@ fn error_status_byte(error: SoftFido2Error) -> u8 {
     }
 }
 
+/// The backup state new discoverable credentials are created with.
+///
+/// Only the human authenticator honours `enable_credential_backup`. An agent principal
+/// is always single-device: its credentials are delegated and must never be exported or
+/// synced, so it ignores the setting even when it is on.
+///
+/// Precondition: none. Postcondition: `Eligible` iff `!is_agent && enable_credential_backup`.
+fn default_backup_state(is_agent: bool, enable_credential_backup: bool) -> CredentialBackupState {
+    if !is_agent && enable_credential_backup {
+        CredentialBackupState::Eligible
+    } else {
+        CredentialBackupState::NotEligible
+    }
+}
+
 fn backup_state_for_export(
     source: CredentialBackupState,
 ) -> core::result::Result<CredentialBackupState, BackupError> {
@@ -749,13 +764,17 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
         pin_config: PinConfig,
         interaction_manager: Option<Arc<AgentInteractionManager>>,
     ) -> Result<Authenticator<PasslessCallbacks<S, P>>> {
+        // Same rule as the key-provider builder below: only an agent principal,
+        // which always has an interaction manager, gets agent options. The
+        // human daemon passes None and must not run with agent options.
+        let use_agent_options = interaction_manager.is_some();
         Self::build_authenticator_with_interaction_and_options(
             storage,
             pin_storage,
             security_config,
             pin_config,
             interaction_manager,
-            true,
+            use_agent_options,
         )
     }
 
@@ -821,7 +840,10 @@ impl<S: CredentialStorage + 'static, P: PinStorage + 'static>
             .extensions(vec!["credProtect".to_string()])
             .firmware_version(*VERSION)
             .constant_sign_count(security_config.constant_signature_counter)
-            .default_credential_backup_state(CredentialBackupState::NotEligible)
+            .default_credential_backup_state(default_backup_state(
+                is_agent,
+                security_config.enable_credential_backup,
+            ))
             .algorithms(vec![-7])
             .max_pin_retries(pin_config.max_retries)
             .auto_lock_timeout(pin_config.auto_lock_timeout)
@@ -1743,6 +1765,143 @@ mod tests {
             backup_state_for_export(CredentialBackupState::BackedUp).unwrap(),
             CredentialBackupState::BackedUp
         );
+    }
+
+    /// Register a resident credential through the CTAP dispatcher and return the
+    /// authenticator-data flags byte of the response.
+    ///
+    /// Precondition: UP/UV are satisfied without a human (the config sets
+    /// `user_verification_registration: false` and `always_uv: false`, and no PIN is set).
+    /// Postcondition: panics unless the registration succeeded.
+    fn register_and_get_flags<F: FnOnce(&mut Vec<u8>) -> soft_fido2::Result<()>>(handle: F) -> u8 {
+        let mut response = Vec::new();
+        handle(&mut response).expect("dispatch makeCredential");
+        assert_eq!(
+            response.first(),
+            Some(&0x00),
+            "makeCredential failed: {response:02x?}"
+        );
+        let value: serde_cbor::Value =
+            serde_cbor::from_slice(&response[1..]).expect("decode makeCredential response");
+        let map = match value {
+            serde_cbor::Value::Map(map) => map,
+            other => panic!("expected makeCredential map, got {other:?}"),
+        };
+        // Key 0x02 is authData; layout is rpIdHash(32) | flags(1) | signCount(4) | ...
+        match map.get(&serde_cbor::Value::Integer(0x02)) {
+            Some(serde_cbor::Value::Bytes(auth_data)) => auth_data[32],
+            other => panic!("expected authData bytes, got {other:?}"),
+        }
+    }
+
+    /// CTAP2 authenticatorMakeCredential request for a discoverable ES256 credential.
+    fn make_credential_request() -> Vec<u8> {
+        use serde_cbor::Value;
+        use std::collections::BTreeMap;
+
+        let text = |s: &str| Value::Text(s.to_string());
+        let rp = Value::Map(BTreeMap::from([
+            (text("id"), text("be-test.example")),
+            (text("name"), text("BE Test")),
+        ]));
+        let user = Value::Map(BTreeMap::from([
+            (text("id"), Value::Bytes(vec![7; 16])),
+            (text("name"), text("alice")),
+            (text("displayName"), text("Alice")),
+        ]));
+        let params = Value::Array(vec![Value::Map(BTreeMap::from([
+            (text("type"), text("public-key")),
+            (text("alg"), Value::Integer(-7)),
+        ]))]);
+        let options = Value::Map(BTreeMap::from([
+            (text("rk"), Value::Bool(true)),
+            (text("up"), Value::Bool(true)),
+        ]));
+        let request = Value::Map(BTreeMap::from([
+            (Value::Integer(1), Value::Bytes(vec![0x42; 32])),
+            (Value::Integer(2), rp),
+            (Value::Integer(3), user),
+            (Value::Integer(4), params),
+            (Value::Integer(7), options),
+        ]));
+        let mut bytes = vec![0x01]; // CTAP command: authenticatorMakeCredential
+        bytes.extend(serde_cbor::to_vec(&request).expect("encode makeCredential"));
+        bytes
+    }
+
+    /// A security config that needs no human: no notification for UP, no UV prompt.
+    fn headless_security_config(enable_credential_backup: bool) -> SecurityConfig {
+        SecurityConfig {
+            enable_credential_backup,
+            always_uv: false,
+            user_verification_registration: false,
+            user_verification_authentication: false,
+            ..Default::default()
+        }
+    }
+
+    const FLAG_BACKUP_ELIGIBLE: u8 = 0x08;
+    const FLAG_BACKUP_STATE: u8 = 0x10;
+
+    /// The human daemon must honour `enable_credential_backup`.
+    ///
+    /// If this fails: the human authenticator was built with agent options, which
+    /// hard-code `NotEligible`, so the setting is silently ignored and every new
+    /// passkey is single-device (BE=0). Relying parties that saw BE=1 elsewhere
+    /// (e.g. a passkey also held by a password manager) then reject it.
+    #[test]
+    fn test_human_authenticator_honours_enable_credential_backup() {
+        for (enabled, expect_be) in [(true, true), (false, false)] {
+            let temp_dir = tempfile::tempdir().expect("create temp directory");
+            let credential_dir = temp_dir.path().join("credentials");
+            std::fs::create_dir_all(&credential_dir).expect("create credential directory");
+            let storage =
+                LocalStorageAdapter::new(credential_dir).expect("create credential storage");
+
+            let mut service = AuthenticatorService::with_pin_storage(
+                storage,
+                None::<Arc<Mutex<()>>>,
+                headless_security_config(enabled),
+                PinConfig::default(),
+            )
+            .expect("create authenticator service");
+
+            let request = make_credential_request();
+            let flags = register_and_get_flags(|response| service.handle(&request, response));
+
+            assert_eq!(
+                flags & FLAG_BACKUP_ELIGIBLE != 0,
+                expect_be,
+                "enable_credential_backup={enabled}: flags=0x{flags:02x}"
+            );
+            assert_eq!(
+                flags & FLAG_BACKUP_STATE,
+                0,
+                "a new credential is eligible but not yet backed up (BS=0): flags=0x{flags:02x}"
+            );
+        }
+    }
+
+    /// Only the human authenticator may be backup eligible; an agent never is.
+    ///
+    /// If this fails: the guard that keeps `enable_credential_backup` human-only was
+    /// lost (agent credentials become backup eligible), or the human path stopped
+    /// honouring the setting. All four input combinations are covered, so dropping
+    /// either half of the condition flips at least one row.
+    #[test]
+    fn test_default_backup_state_is_eligible_only_for_human_with_setting_on() {
+        for (is_agent, enabled, expected) in [
+            (false, true, CredentialBackupState::Eligible),
+            (false, false, CredentialBackupState::NotEligible),
+            (true, true, CredentialBackupState::NotEligible),
+            (true, false, CredentialBackupState::NotEligible),
+        ] {
+            assert_eq!(
+                default_backup_state(is_agent, enabled),
+                expected,
+                "is_agent={is_agent}, enable_credential_backup={enabled}"
+            );
+        }
     }
 
     #[test]
