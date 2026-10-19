@@ -87,10 +87,16 @@ fn action_mode_for_server(
 ) -> NotificationActionMode {
     let server_name = server_name.to_lowercase();
 
+    // Quickshell (Omarchy's notification server) reports a real version
+    // (e.g. "1.2"), unlike mako's "0.0.0" placeholder. Match by name alone:
+    // its toasts render no action buttons, so Explicit mode's approve/deny
+    // can never be clicked and every prompt silently denies.
+    if server_name == "quickshell" {
+        return NotificationActionMode::Default;
+    }
+
     match (server_name.as_str(), server_version) {
-        ("notify-osd", "1.0") | ("mako", "0.0.0") | ("quickshell", "") => {
-            NotificationActionMode::Default
-        }
+        ("notify-osd", "1.0") | ("mako", "0.0.0") => NotificationActionMode::Default,
         ("dunst", _) if prompt_kind == PromptKind::UserPresence => {
             NotificationActionMode::DunstDefault
         }
@@ -444,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_legacy_default_action_servers_are_preserved() {
-        for (name, version) in [("notify-osd", "1.0"), ("mako", "0.0.0"), ("quickshell", "")] {
+        for (name, version) in [("notify-osd", "1.0"), ("mako", "0.0.0")] {
             for prompt_kind in [
                 PromptKind::UserPresence,
                 PromptKind::UserVerification,
@@ -452,6 +458,28 @@ mod tests {
             ] {
                 assert_eq!(
                     action_mode_for_server(name, version, prompt_kind),
+                    NotificationActionMode::Default
+                );
+            }
+        }
+    }
+
+    // If this fails: quickshell changed its reported version and no longer
+    // matches by name — every Omarchy prompt silently denies again.
+    #[test]
+    fn test_quickshell_matches_by_name_regardless_of_version() {
+        for version in ["", "0.0.0", "1.2", "9.9.9"] {
+            for prompt_kind in [
+                PromptKind::UserPresence,
+                PromptKind::UserVerification,
+                PromptKind::YesNo,
+            ] {
+                assert_eq!(
+                    action_mode_for_server("quickshell", version, prompt_kind),
+                    NotificationActionMode::Default
+                );
+                assert_eq!(
+                    action_mode_for_server("QuickShell", version, prompt_kind),
                     NotificationActionMode::Default
                 );
             }
